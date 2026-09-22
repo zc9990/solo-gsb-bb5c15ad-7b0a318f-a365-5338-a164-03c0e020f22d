@@ -31,7 +31,7 @@ docker compose up -d --build
 | 健康检查 | http://localhost:8000/health |
 
 - SQLite 数据文件持久化在 Docker 卷 `trace-data`（容器内 `/data/traceability.db`）。
-- 首次启动且数据库为空时自动写入演示数据（4 个场景，见第四节）。
+- 首次启动且数据库为空时自动写入演示数据（4 个场景，见第六节）。
   不需要演示数据时，将 `docker-compose.yml` 中的 `SEED_DEMO` 改为 `"0"`。
 - 修改代码后重建：`docker compose up -d --build`；清空数据：`docker compose down -v`。
 
@@ -48,7 +48,7 @@ docker run -p 8000:8000 -e SEED_DEMO=1 -v trace-data:/data metrological-traceabi
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（10 个用例）
+pytest -q        # 运行测试（18 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -94,6 +94,7 @@ trace_edges（父子溯源边）
 | **GET** | **`/api/trace/{instrument}?at=`** | **链路查询：重建唯一证书链** |
 | **GET** | **`/api/reports/{instrument}?at=`** | **校验报告（冲突明细）** |
 | **GET** | **`/api/export/{instrument}?at=`** | **JSON 导出（attachment 下载）** |
+| **POST** | **`/api/assessments/certificate-deactivation`** | **证书停用影响评估（dry-run，不写库）** |
 | POST | `/api/admin/reset` | 清空全部数据（演示/测试用） |
 
 ### 1）批量提交
@@ -185,9 +186,88 @@ curl -OJ "http://localhost:8000/api/export/W?at=2026-06-15T00:00:00Z"
 每个冲突都带 `node`（证书 id）、`path_index`（所属候选链下标，节点级为 null）
 与 `detail`（结构化证据），便于定位到具体证书和证据数值。
 
+### 5）证书停用影响评估（dry-run 模拟）
+
+证书因吊销/过期/发现问题需要停用时，先评估影响范围再操作。提交**查询时点**与
+**待停用证书 id 列表**，服务端在内存中模拟移除这些证书及其全部关联溯源边
+（`child` 或 `parent` 命中即移除），**不写入数据库**（响应恒带 `dry_run: true`），
+重新评估每台受影响仪器的唯一链 / 多候选 / 断裂状态，并给出：
+
+- `before` / `after`：停用前后的完整评估快照（与 `/api/reports` 同构）；
+- `transition`：状态迁移（如 `unique_to_broken`、`ambiguous_to_unique`、`unchanged`）；
+- `severed_chains`：停用前存在、因途经被停用证书而被切断的链（含被切断的候选链）；
+- `alternative_chain` / `alternative_chains`：停用后仍成立的唯一替代链 / 全部候选链摘要；
+- `simulation_notes`：可解释说明（`severity=INFO`，非真实数据冲突）。
+
+默认自动覆盖所有受影响仪器（被停用证书所属仪器 + 停用前任一溯源链经过这些证书的
+仪器）；也可用 `instrument_codes` 仅筛选指定仪器评估。
+
+```bash
+curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
+  -H 'Content-Type: application/json' -d '{
+  "at": "2026-06-15T00:00:00Z",
+  "certificate_ids": ["CR"],
+  "instrument_codes": ["W"]
+}'
+```
+
+```jsonc
+{
+  "at": "2026-06-15T00:00:00Z",
+  "dry_run": true,                       // 恒为 true：模拟不写库
+  "disabled_certificate_ids": ["CR"],
+  "instruments_filter": ["W"],           // null 表示自动覆盖全部受影响仪器
+  "affected_owner_instruments": ["R"],   // 被停用证书直接所属仪器
+  "removed_edge_count": 2,               // 一并模拟移除的溯源边数
+  "affected_instrument_count": 1,
+  "evaluated_instrument_count": 1,
+  "transition_counts": {"unique_to_broken": 1},
+  "results": [
+    {
+      "instrument": "W",
+      "impacted": true,
+      "transition": "unique_to_broken",
+      "before": { "resolution": "unique", "active_chain": { /* ... */ } },
+      "after":  { "resolution": "broken", "conflicts": [ /* ... */ ] },
+      "alternative_chain": null,         // 停用后无唯一有效替代链
+      "alternative_chains": [],
+      "severed_chains": [
+        { "role": "active",              // active | candidate | broken
+          "certificate_ids": ["CW", "CR", "CG"],
+          "reaches_national_standard": true,
+          "disabled_certificates_on_path": ["CR"],
+          "chain": { "nodes": [ /* ... */ ], "edges": [ /* ... */ ] } }
+      ],
+      "simulation_notes": [
+        {"code": "SIMULATED_CHAIN_SEVERED", "severity": "INFO", "message": "..."},
+        {"code": "SIMULATED_NO_ALTERNATIVE_CHAIN", "severity": "INFO", "message": "..."}
+      ]
+    }
+  ],
+  "statistics": {"certificates_before": 3, "certificates_after": 2,
+                 "edges_before": 2, "edges_after": 0}
+}
+```
+
+> 多候选场景停用一条参考通道后，若另一通道仍成立，`transition` 为
+> `ambiguous_to_unique`，替代链出现在 `alternative_chain`。
+> 待停用证书 id 不存在或筛选仪器不存在时返回 **422**（中文原因）；
+> 重复/带空白的证书 id 会自动去重。
+
+模拟说明（`simulation_notes`，均为 INFO 级）：
+
+| code | 含义 |
+| --- | --- |
+| `SIMULATED_START_CERTIFICATE_REMOVED` | 仪器在查询时点的有效起点证书被停用 |
+| `SIMULATED_CHAIN_SEVERED` | 停用前的链/候选链途经被停用证书，已被切断（附链与命中证书） |
+| `SIMULATED_ALTERNATIVE_CHAIN_AVAILABLE` | 停用后仍存在唯一有效替代链（附替代链节点） |
+| `SIMULATED_NO_ALTERNATIVE_CHAIN` | 停用后断裂，不存在唯一有效替代链 |
+| `SIMULATED_AMBIGUOUS_AFTER_DEACTIVATION` | 停用后仍为多候选，无唯一替代链 |
+| `SIMULATED_NO_EFFECT` | 停用证书不在该仪器该时点的溯源路径上，状态不变 |
+
 ---
 
-## 五、内置演示场景
+## 六、内置演示场景
 
 演示查询时点统一为 **2026-06-15T00:00:00Z**：
 
@@ -205,7 +285,26 @@ curl "http://localhost:8000/api/reports/INST-T1?at=2026-06-15T00:00:00Z"
 curl "http://localhost:8000/api/reports/INST-B1?at=2026-06-15T00:00:00Z"
 ```
 
-## 六、溯源算法说明
+停用评估示例（dry-run）：停用压力多候选中的活塞压力计通道证书，观察
+`INST-P1` 由 `ambiguous` 变为经数字校准器 B 的 `unique` 替代链；停用一等量块
+证书 `CR1-1` 则会使 `INST-W1` 由唯一链变为断裂：
+
+```bash
+curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
+  -H 'Content-Type: application/json' -d '{
+  "at": "2026-06-15T00:00:00Z",
+  "certificate_ids": ["CPRA-1"]
+}'
+
+curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
+  -H 'Content-Type: application/json' -d '{
+  "at": "2026-06-15T00:00:00Z",
+  "certificate_ids": ["CR1-1"],
+  "instrument_codes": ["INST-W1"]
+}'
+```
+
+## 七、溯源算法说明
 
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
 2. 自起点沿在 `at` 有效的边做 DFS 枚举（同父子证书的并行边合并；检测环；500 条上限保护）；
@@ -214,8 +313,11 @@ curl "http://localhost:8000/api/reports/INST-B1?at=2026-06-15T00:00:00Z"
    不确定度单调不收缩、单位一致、边覆盖校准时刻）检查；对链上全部仪器检查历史区间连续性；
 5. 决策：成链且零 ERROR 的路径恰有 1 条 → `unique`；≥2 条 → `ambiguous`；
    0 条 → `broken`。所有 ERROR/WARN 汇总为可解释冲突列表。
+6. 证书停用影响评估：在内存 Catalog 中移除证书及其关联边（不写库），对每台受影响
+   仪器分别在停用前/后的 Catalog 上重跑步骤 1~5，比较状态与链指纹，输出迁移、
+   被切断链、替代链与 INFO 级模拟说明。
 
-## 七、项目结构
+## 八、项目结构
 
 ```
 app/
@@ -223,10 +325,11 @@ app/
   database.py        SQLite 连接、表结构
   schemas.py         Pydantic 请求/响应模型
   crud.py            upsert 与写入期校验
-  engine.py          溯源链重建（DFS）与全部校验规则
+  engine.py          溯源链重建（DFS）、校验规则、停用影响模拟（内存 Catalog）
   seed.py            四场景演示数据
   routers/           instruments / certificates / edges /
-                     submissions / trace(report) / export / admin
-tests/test_trace.py  10 个接口级测试
+                     submissions / trace(report + 停用影响评估) / export / admin
+tests/test_trace.py        10 个接口级测试
+tests/test_deactivation.py 8 个停用影响评估测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```

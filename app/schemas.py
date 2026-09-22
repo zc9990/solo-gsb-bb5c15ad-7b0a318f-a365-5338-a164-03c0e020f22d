@@ -79,6 +79,37 @@ class SubmissionIn(BaseModel):
     edges: List[TraceEdgeIn] = Field(default_factory=list)
 
 
+class DeactivationIn(BaseModel):
+    """证书停用影响评估请求（dry-run，不写入数据库）。"""
+    at: Optional[datetime] = Field(
+        None, description="查询时点（UTC）；留空取服务端当前时间"
+    )
+    certificate_ids: List[str] = Field(
+        ..., min_length=1, description="待停用证书 id 列表（至少 1 张）"
+    )
+    instrument_codes: Optional[List[str]] = Field(
+        None,
+        description="仅评估指定仪器；留空则自动覆盖全部受影响仪器",
+    )
+
+    @field_validator("certificate_ids")
+    @classmethod
+    def _check_certificate_ids(cls, v: List[str]) -> List[str]:
+        if any(not cid or not cid.strip() for cid in v):
+            raise ValueError("证书 id 不能为空字符串")
+        return v
+
+    @field_validator("instrument_codes")
+    @classmethod
+    def _check_instrument_codes(cls, v):
+        if v is not None:
+            if len(v) == 0:
+                raise ValueError("仪器编码筛选列表不能为空")
+            if any(not c or not c.strip() for c in v):
+                raise ValueError("仪器编码不能为空字符串")
+        return v
+
+
 # ---------- 输出 ----------
 
 class InstrumentOut(InstrumentIn):
@@ -176,4 +207,92 @@ class TraceReport(BaseModel):
     conflicts: List[Conflict] = Field(default_factory=list)
     error_count: int = 0
     warning_count: int = 0
+    statistics: dict = Field(default_factory=dict)
+
+
+# ---------- 证书停用影响评估输出 ----------
+
+class ChainSummary(BaseModel):
+    role: str = Field(
+        ...,
+        description="链在评估中的角色：active=唯一有效链 | candidate=候选链 | broken=断裂分支",
+    )
+    certificate_ids: List[str]
+    node_count: int
+    reaches_national_standard: bool
+    contains_disabled_certificate: bool
+    disabled_certificates_on_path: List[str]
+    errors: int = 0
+    warnings: int = 0
+    chain: Chain = Field(..., description="完整链（节点 + 边）摘要")
+
+
+class TraceStateSnapshot(BaseModel):
+    """停用前/后任一时刻的完整评估快照（与 TraceReport 同构）。"""
+    resolution: str
+    valid: bool
+    starts: List[str]
+    active_chain: Optional[Chain] = None
+    candidates: List[Chain] = Field(default_factory=list)
+    broken_chains: List[Chain] = Field(default_factory=list)
+    conflicts: List[Conflict] = Field(default_factory=list)
+    error_count: int = 0
+    warning_count: int = 0
+    statistics: dict = Field(default_factory=dict)
+
+
+class InstrumentDeactivationResult(BaseModel):
+    instrument: str
+    impacted: bool = Field(..., description="停用前后评估结果是否发生变化")
+    transition: str = Field(
+        ...,
+        description=(
+            "状态迁移：unchanged | unique_to_broken | unique_to_ambiguous | "
+            "ambiguous_to_unique | ambiguous_to_broken | broken_to_unique | "
+            "broken_to_ambiguous"
+        ),
+    )
+    before: TraceStateSnapshot = Field(..., description="停用前状态")
+    after: TraceStateSnapshot = Field(..., description="停用后（模拟）状态")
+    alternative_chain: Optional[ChainSummary] = Field(
+        None, description="停用后的唯一有效替代链（若存在）"
+    )
+    alternative_chains: List[ChainSummary] = Field(
+        default_factory=list,
+        description="停用后仍存在的全部到基准候选链（多候选时 >=2）",
+    )
+    severed_chains: List[ChainSummary] = Field(
+        default_factory=list,
+        description="停用前存在、因途经被停用证书而被切断的链",
+    )
+    simulation_notes: List[Conflict] = Field(
+        default_factory=list,
+        description="模拟过程的可解释说明（severity=INFO，非真实数据冲突）",
+    )
+
+
+class DeactivationImpactReport(BaseModel):
+    at: datetime
+    dry_run: bool = Field(
+        ..., description="恒为 true：模拟不写入数据库"
+    )
+    disabled_certificate_ids: List[str]
+    unknown_certificate_ids: List[str] = Field(
+        default_factory=list, description="不存在于库中的待停用证书 id"
+    )
+    instruments_filter: Optional[List[str]] = Field(
+        None, description="请求指定的仪器筛选范围；未筛选为 null"
+    )
+    affected_owner_instruments: List[str] = Field(
+        default_factory=list, description="被停用证书直接所属的仪器编码"
+    )
+    removed_edge_count: int = Field(
+        ..., description="模拟中一并移除的溯源边数量"
+    )
+    affected_instrument_count: int
+    evaluated_instrument_count: int
+    transition_counts: dict = Field(
+        default_factory=dict, description="按状态迁移类型计数"
+    )
+    results: List[InstrumentDeactivationResult]
     statistics: dict = Field(default_factory=dict)
