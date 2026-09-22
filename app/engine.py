@@ -17,11 +17,11 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 from typing import Any, Optional
 
-from .crud import get_instrument
 from .utils import UNCERTAINTY_EPS, compute_digest, fmt, to_utc_naive
 
 MAX_PATHS = 500  # 候选链枚举上限，防止异常数据下的指数膨胀
@@ -30,19 +30,46 @@ MAX_PATHS = 500  # 候选链枚举上限，防止异常数据下的指数膨胀
 # ---------------------------------------------------------------- 数据装载
 
 class Catalog:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self.instruments = {
-            r["code"]: r
-            for r in conn.execute("SELECT * FROM instruments").fetchall()
-        }
-        self.certs = {
-            r["id"]: r
-            for r in conn.execute("SELECT * FROM certificates").fetchall()
-        }
-        self.edges = conn.execute("SELECT * FROM trace_edges").fetchall()
-        self.out_edges: dict[str, list[sqlite3.Row]] = {}
+    """内存中的仪器/证书/溯源边快照。
+
+    评估类接口（如证书停用影响评估）直接在内存快照上做投影，
+    不执行任何 DELETE/UPDATE，因此不会写入数据库。
+    """
+
+    def __init__(self, instruments, certs, edges) -> None:
+        self.instruments: dict[str, dict[str, Any]] = instruments
+        self.certs: dict[str, dict[str, Any]] = certs
+        self.edges: list[dict[str, Any]] = edges
+        self.out_edges: dict[str, list[dict[str, Any]]] = {}
         for e in self.edges:
             self.out_edges.setdefault(e["child_cert_id"], []).append(e)
+
+    @classmethod
+    def from_conn(cls, conn: sqlite3.Connection) -> "Catalog":
+        instruments = {
+            r["code"]: dict(r)
+            for r in conn.execute("SELECT * FROM instruments").fetchall()
+        }
+        certs = {
+            r["id"]: dict(r)
+            for r in conn.execute("SELECT * FROM certificates").fetchall()
+        }
+        edges = [dict(r) for r in conn.execute("SELECT * FROM trace_edges").fetchall()]
+        return cls(instruments, certs, edges)
+
+    def deactivated_view(self, cert_ids: set[str]) -> "Catalog":
+        """模拟停用：返回移除指定证书及其全部关联溯源边后的新 Catalog。
+
+        原始 Catalog 与数据库均保持不变；仪器记录保留（停用后可能持有 0 张证书）。
+        """
+        certs = {cid: c for cid, c in self.certs.items() if cid not in cert_ids}
+        edges = [
+            e
+            for e in self.edges
+            if e["child_cert_id"] not in cert_ids
+            and e["parent_cert_id"] not in cert_ids
+        ]
+        return Catalog(dict(self.instruments), certs, edges)
 
 
 # ---------------------------------------------------------------- 冲突
@@ -391,19 +418,14 @@ def _serialize_chain(cat: Catalog, path: dict[str, Any]) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 主入口
 
-def build_report(
-    conn: sqlite3.Connection,
-    instrument_code: str,
-    at: Optional[datetime] = None,
-) -> dict[str, Any]:
-    at_naive = to_utc_naive(at) if at else datetime.utcnow()
-    at_s = fmt(at_naive)
+def _evaluate(cat: Catalog, instrument_code: str, at_s: str) -> dict[str, Any]:
+    """在给定 Catalog 快照上重建并评估一台仪器在 ``at_s`` 时点的溯源状态。
 
-    instrument = get_instrument(conn, instrument_code)
-    if instrument is None:
+    仪器不存在时抛出 ``KeyError``。纯内存计算，不读写数据库。
+    """
+    if instrument_code not in cat.instruments:
         raise KeyError(instrument_code)
 
-    cat = Catalog(conn)
     global_issues: list[dict[str, Any]] = []
 
     # 1) 起点：该仪器在 at 生效的证书
@@ -502,13 +524,14 @@ def build_report(
 
     # 6) 决策：唯一 / 多候选 / 断裂
     chains = [_serialize_chain(cat, p) for p in paths]
+    path_index = {id(p): idx for idx, p in enumerate(paths)}
     for p, ch in zip(paths, chains):
+        ch["path_index"] = path_index[id(p)]
         ch["errors"] = p["error_count"]
         ch["warnings"] = (
             sum(1 for i in p["issues"] if i["severity"] == "WARN")
             + sum(1 for i in p["chain_issues"] if i["severity"] == "WARN")
         )
-    path_index = {id(p): idx for idx, p in enumerate(paths)}
 
     if len(valid_root) >= 2:
         resolution = "ambiguous"
@@ -629,4 +652,389 @@ def build_report(
                 len(active_chain["nodes"]) if active_chain else None
             ),
         },
+    }
+
+
+def build_report(
+    conn: sqlite3.Connection,
+    instrument_code: str,
+    at: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """从数据库装载快照并重建单台仪器的溯源校验报告。"""
+    at_naive = to_utc_naive(at) if at else datetime.utcnow()
+    at_s = fmt(at_naive)
+    cat = Catalog.from_conn(conn)
+    return _evaluate(cat, instrument_code, at_s)
+
+
+# ---------------------------------------------------- 证书停用影响评估
+
+_DEACTIVATION_NOTE = {
+    "NO_ACTIVE_CERTIFICATE": "停用后该仪器在查询时点已无有效证书，溯源链无法开始",
+    "DEAD_END": "停用后原继续向上溯源的边被一并移除，节点成为死路",
+    "PARENT_CERT_NOT_ACTIVE": "停用后原上级证书被移除，沿边无法继续溯源",
+    "MULTIPLE_VALID_CHAINS": "停用后候选链集合发生变化，仍存在多条均有效的链",
+    "CHAIN_BROKEN": "停用后全部候选分支均在到达国家基准前终止",
+    "ALL_CHAINS_FAILED_CHECKS": "停用后到达国家基准的候选链均未通过校验",
+}
+
+
+def _conflict_key(c: dict[str, Any]) -> tuple:
+    """冲突身份键：同 code/node/instrument/detail 视为同一冲突。
+
+    path_index 属于链下标，停用会改变枚举顺序，故不纳入身份比较。
+    """
+    return (
+        c.get("code"),
+        c.get("severity"),
+        c.get("node"),
+        c.get("instrument"),
+        json.dumps(c.get("detail", {}), ensure_ascii=False, sort_keys=True),
+    )
+
+
+# 反映当前（at 时点）溯源结构的冲突编码；历史区间类（如 INTERVAL_GAP）
+# 即使引用的证书被停用，也不改变 at 时点的实际溯源状态
+_STRUCTURAL_CONFLICT_CODES = {
+    "NO_ACTIVE_CERTIFICATE",
+    "MULTIPLE_ACTIVE_CERTIFICATES",
+    "DEAD_END",
+    "PARENT_CERT_NOT_ACTIVE",
+    "CYCLE_DETECTED",
+    "SIGNATURE_DIGEST_MISMATCH",
+    "PARENT_INTERVAL_NOT_COVER_CALIBRATION",
+    "UNCERTAINTY_UNIT_MISMATCH",
+    "UNCERTAINTY_REGRESSION",
+    "MULTIPLE_VALID_CHAINS",
+    "ALL_CHAINS_FAILED_CHECKS",
+    "CHAIN_BROKEN",
+}
+
+
+def _conflict_signature(report: dict[str, Any]) -> set[tuple]:
+    """报告中影响 at 时点溯源结构的冲突身份集合，用于前后状态比较。"""
+    return {
+        _conflict_key(c)
+        for c in report["conflicts"]
+        if c.get("code") in _STRUCTURAL_CONFLICT_CODES
+    }
+
+
+def _path_signature(report: dict[str, Any]) -> set[tuple[str, ...]]:
+    """报告全部候选路径的证书序列集合（叶子->根）。"""
+    groups = [report["active_chain"]] if report["active_chain"] else []
+    groups += report["candidates"] + report["broken_chains"]
+    return {tuple(n["certificate_id"] for n in ch["nodes"]) for ch in groups}
+
+
+def _conflict_diff(
+    before: list[dict[str, Any]], after: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """返回停用后新出现（或此前不存在）的冲突，path_index 按 after 报告给出。"""
+    before_keys = {_conflict_key(c) for c in before}
+    diff: list[dict[str, Any]] = []
+    for c in after:
+        if _conflict_key(c) not in before_keys:
+            entry = dict(c)
+            entry["deactivation_note"] = _DEACTIVATION_NOTE.get(
+                c.get("code"), "该冲突在停用后评估中新出现"
+            )
+            diff.append(entry)
+    return diff
+
+
+def _chain_summary(cat: Catalog, chain: dict[str, Any]) -> dict[str, Any]:
+    """链摘要：叶子->根的证书/仪器序列与边，不含完整区间，便于前后对比。"""
+    return {
+        "path_index": chain.get("path_index"),
+        "certificate_ids": [n["certificate_id"] for n in chain["nodes"]],
+        "certificate_numbers": [n["cert_number"] for n in chain["nodes"]],
+        "instrument_codes": [n["instrument_code"] for n in chain["nodes"]],
+        "edges": [
+            {"edge_id": e["edge_id"],
+             "child_cert_id": e["child_cert_id"],
+             "parent_cert_id": e["parent_cert_id"]}
+            for e in chain["edges"]
+        ],
+        "reaches_national_standard": chain["reaches_national_standard"],
+        "errors": chain["errors"],
+        "warnings": chain["warnings"],
+    }
+
+
+def _chain_blockers(chain: dict[str, Any], conflicts: list[dict[str, Any]]) -> list[str]:
+    """该链未通过校验时，归属于它（path_index 或链上节点）的 ERROR 编码。"""
+    idx = chain.get("path_index")
+    node_ids = {n["certificate_id"] for n in chain["nodes"]}
+    codes: set[str] = set()
+    for c in conflicts:
+        if c["severity"] != "ERROR":
+            continue
+        if c.get("path_index") == idx or (
+            c.get("path_index") is None and c.get("node") in node_ids
+        ):
+            codes.add(c["code"])
+    return sorted(codes)
+
+
+def _alternative_chains(
+    cat: Catalog, report: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """停用后全部候选路径的摘要及角色判定。"""
+    summaries: list[dict[str, Any]] = []
+
+    def add(chain, role):
+        item = _chain_summary(cat, chain)
+        item["role"] = role
+        blockers = _chain_blockers(chain, report["conflicts"])
+        if role in ("invalid_candidate", "broken_branch"):
+            item["blocked_by"] = blockers
+        summaries.append(item)
+
+    if report["active_chain"] is not None:
+        add(report["active_chain"], "active")
+    for ch in report["candidates"]:
+        add(ch, "candidate")
+    for ch in report["broken_chains"]:
+        role = (
+            "invalid_candidate"
+            if ch["reaches_national_standard"]
+            else "broken_branch"
+        )
+        add(ch, role)
+    return summaries
+
+
+def _removed_elements(
+    cat_before: Catalog,
+    report: dict[str, Any],
+    removed_ids: set[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """收集一条报告所涉及、且已被停用移除的证书 id 与边。"""
+    certs_on_paths: set[str] = set()
+    edges_on_paths: list[dict[str, Any]] = []
+    groups = [report["active_chain"]] if report["active_chain"] else []
+    groups += report["candidates"] + report["broken_chains"]
+    for ch in groups:
+        certs_on_paths.update(n["certificate_id"] for n in ch["nodes"])
+        for e in ch["edges"]:
+            edges_on_paths.append(e)
+    certs = sorted(certs_on_paths & removed_ids)
+    edges = []
+    seen_edge_ids: set[int] = set()
+    for e in edges_on_paths:
+        if e["edge_id"] in seen_edge_ids:
+            continue
+        seen_edge_ids.add(e["edge_id"])
+        if e["child_cert_id"] in removed_ids or e["parent_cert_id"] in removed_ids:
+            edges.append(
+                {
+                    "edge_id": e["edge_id"],
+                    "child_cert_id": e["child_cert_id"],
+                    "parent_cert_id": e["parent_cert_id"],
+                }
+            )
+    return certs, edges
+
+
+def _classify_impact(before: dict[str, Any], after: dict[str, Any]) -> str:
+    """停用前后状态对比 -> 影响分级。
+
+    * ``unchanged`` — 解析结果与有效链均未变化；
+    * ``degraded`` — unique -> ambiguous/broken，或 ambiguous -> broken；
+    * ``improved`` — 由 ambiguous/broken 变为唯一有效链（多候选被消除）；
+    * ``affected`` — 同为多候选或断裂，但候选路径或结构性冲突发生变化。
+    """
+    b_res, a_res = before["resolution"], after["resolution"]
+    rank = {"unique": 2, "ambiguous": 1, "broken": 0}
+    if rank[a_res] < rank[b_res]:
+        return "degraded"
+    if rank[a_res] > rank[b_res]:
+        return "improved"
+    if (
+        _path_signature(before) == _path_signature(after)
+        and _conflict_signature(before) == _conflict_signature(after)
+        and before["starts"] == after["starts"]
+    ):
+        return "unchanged"
+    return "affected"
+
+
+def _discover_affected(
+    cat: Catalog,
+    removed_ids: set[str],
+    before_reports: dict[str, dict[str, Any]],
+) -> list[str]:
+    """未指定仪器筛选时：找出停用前溯源路径触及被移除证书/边的仪器，
+    再并入被停用证书所属仪器（停用起点的直接影响）。"""
+    affected: set[str] = set()
+    for cid in removed_ids:
+        cert = cat.certs.get(cid)
+        if cert is not None:
+            affected.add(cert["instrument_code"])
+    for code, report in before_reports.items():
+        groups = [report["active_chain"]] if report["active_chain"] else []
+        groups += report["candidates"] + report["broken_chains"]
+        for ch in groups:
+            if any(n["certificate_id"] in removed_ids for n in ch["nodes"]):
+                affected.add(code)
+                break
+            if any(
+                e["child_cert_id"] in removed_ids or e["parent_cert_id"] in removed_ids
+                for e in ch["edges"]
+            ):
+                affected.add(code)
+                break
+    return sorted(affected)
+
+
+def assess_certificate_deactivation(
+    conn: sqlite3.Connection,
+    at: datetime,
+    deactivated_cert_ids: list[str],
+    instrument_codes: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """证书停用影响评估（模拟，不写入数据库）。
+
+    1. 装载当前数据为内存快照；
+    2. 在内存中移除待停用证书及其全部关联溯源边，得到停用视图；
+    3. 对受影响（或调用方指定）的仪器分别在停用前/后视图上重建溯源链；
+    4. 对比唯一链/多候选/断裂状态、替代链与新增可解释冲突。
+    """
+    at_naive = to_utc_naive(at) if at else datetime.utcnow()
+    at_s = fmt(at_naive)
+
+    cat = Catalog.from_conn(conn)
+
+    ids = sorted({cid.strip() for cid in deactivated_cert_ids if cid.strip()})
+    unknown = sorted(cid for cid in ids if cid not in cat.certs)
+    if unknown:
+        raise KeyError(("certificate", unknown))
+    removed = set(ids)
+
+    codes: Optional[list[str]] = (
+        sorted({c.strip() for c in instrument_codes if c.strip()})
+        if instrument_codes
+        else None
+    )
+    if codes:
+        missing = sorted(c for c in codes if c not in cat.instruments)
+        if missing:
+            raise KeyError(("instrument", missing))
+
+    cat_after = cat.deactivated_view(removed)
+    all_codes = sorted(cat.instruments)
+    before_reports = {code: _evaluate(cat, code, at_s) for code in all_codes}
+
+    targets = codes if codes is not None else _discover_affected(
+        cat, removed, before_reports
+    )
+
+    removed_cert_info = []
+    for cid in ids:
+        c = cat.certs[cid]
+        removed_cert_info.append(
+            {
+                "certificate_id": cid,
+                "cert_number": c["cert_number"],
+                "instrument_code": c["instrument_code"],
+            }
+        )
+    removed_edges = [
+        {
+            "edge_id": e["id"],
+            "child_cert_id": e["child_cert_id"],
+            "parent_cert_id": e["parent_cert_id"],
+            "valid_from": e["valid_from"],
+            "valid_until": e["valid_until"],
+            "note": e["note"],
+        }
+        for e in cat.edges
+        if e["child_cert_id"] in removed or e["parent_cert_id"] in removed
+    ]
+
+    results: list[dict[str, Any]] = []
+    summary_counts = {
+        "unchanged": 0,
+        "degraded": 0,
+        "improved": 0,
+        "affected": 0,
+    }
+    before_resolution_counts: dict[str, int] = {}
+    after_resolution_counts: dict[str, int] = {}
+
+    for code in targets:
+        before = before_reports[code]
+        after = _evaluate(cat_after, code, at_s)
+        impact = _classify_impact(before, after)
+        summary_counts[impact] += 1
+        before_resolution_counts[before["resolution"]] = (
+            before_resolution_counts.get(before["resolution"], 0) + 1
+        )
+        after_resolution_counts[after["resolution"]] = (
+            after_resolution_counts.get(after["resolution"], 0) + 1
+        )
+        new_conflicts = _conflict_diff(before["conflicts"], after["conflicts"])
+        # after 视图中被移除元素已不存在，从 before 报告采集受影响路径上的移除项
+        removed_cert_hit, removed_edge_hit_list = _removed_elements(
+            cat, before, removed
+        )
+        removed_edge_hit = {e["edge_id"]: e for e in removed_edge_hit_list}
+
+        results.append(
+            {
+                "instrument_code": code,
+                "instrument_name": cat.instruments[code]["name"],
+                "impact": impact,
+                "before": {
+                    "resolution": before["resolution"],
+                    "valid": before["valid"],
+                    "active_chain": (
+                        _chain_summary(cat, before["active_chain"])
+                        if before["active_chain"]
+                        else None
+                    ),
+                    "error_count": before["error_count"],
+                    "warning_count": before["warning_count"],
+                },
+                "after": {
+                    "resolution": after["resolution"],
+                    "valid": after["valid"],
+                    "active_chain": (
+                        {
+                            **_chain_summary(cat_after, after["active_chain"]),
+                            "role": "active",
+                        }
+                        if after["active_chain"]
+                        else None
+                    ),
+                    "alternative_chains": _alternative_chains(cat_after, after),
+                    "error_count": after["error_count"],
+                    "warning_count": after["warning_count"],
+                },
+                "new_conflicts": new_conflicts,
+                "removed_certificates_on_paths": removed_cert_hit,
+                "removed_edges_on_paths": [
+                    removed_edge_hit[k] for k in sorted(removed_edge_hit)
+                ],
+            }
+        )
+
+    return {
+        "at": at_s,
+        "deactivated_certificate_ids": ids,
+        "deactivated_certificates": removed_cert_info,
+        "removed_edges": removed_edges,
+        "filtered_by_instruments": codes is not None,
+        "affected_instrument_count": len(targets),
+        "summary": {
+            "unchanged": summary_counts["unchanged"],
+            "degraded": summary_counts["degraded"],
+            "improved": summary_counts["improved"],
+            "affected": summary_counts["affected"],
+            "resolution_before": before_resolution_counts,
+            "resolution_after": after_resolution_counts,
+        },
+        "results": results,
+        "simulation_only": True,
     }

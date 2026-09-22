@@ -48,7 +48,7 @@ docker run -p 8000:8000 -e SEED_DEMO=1 -v trace-data:/data metrological-traceabi
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（10 个用例）
+pytest -q        # 运行测试（17 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -94,6 +94,7 @@ trace_edges（父子溯源边）
 | **GET** | **`/api/trace/{instrument}?at=`** | **链路查询：重建唯一证书链** |
 | **GET** | **`/api/reports/{instrument}?at=`** | **校验报告（冲突明细）** |
 | **GET** | **`/api/export/{instrument}?at=`** | **JSON 导出（attachment 下载）** |
+| **POST** | **`/api/assessments/certificate-deactivation`** | **证书停用影响评估（模拟，不写库）** |
 | POST | `/api/admin/reset` | 清空全部数据（演示/测试用） |
 
 ### 1）批量提交
@@ -185,6 +186,116 @@ curl -OJ "http://localhost:8000/api/export/W?at=2026-06-15T00:00:00Z"
 每个冲突都带 `node`（证书 id）、`path_index`（所属候选链下标，节点级为 null）
 与 `detail`（结构化证据），便于定位到具体证书和证据数值。
 
+### 5）证书停用影响评估（模拟，不写入数据库）
+
+计划停用一张（或多张）证书前，提交**查询时点**与**待停用证书 id 列表**；
+服务端在内存中模拟移除这些证书及其全部关联溯源边（子端或父端命中即移除），
+在同一时点重新评估每台受影响仪器的**唯一链 / 多候选 / 断链**状态，并给出：
+
+- 停用前后状态（`before` / `after`，含 resolution、valid、链摘要、错误数）；
+- `impact` 影响分级：`unchanged` / `degraded` / `improved` / `affected`；
+- 停用后的**替代链摘要**（`alternative_chains`，标注 `active` / `candidate` /
+  `invalid_candidate` / `broken_branch` 角色及 `blocked_by` 阻断原因）；
+- 停用后**新出现的可解释冲突** `new_conflicts`（沿用冲突编码并附
+  `deactivation_note` 中文说明）；
+- 该仪器路径上被移除的证书与边。
+
+整个过程仅在内存快照上计算，**不执行任何 DELETE/UPDATE**，响应恒带
+`"simulation_only": true`。请求体：
+
+```jsonc
+{
+  "at": "2026-06-15T00:00:00Z",      // 必填：评估时点（UTC）
+  "deactivated_certificate_ids": ["CR1-1"],  // 必填：待停用证书 id（>=1 个）
+  "instrument_codes": ["INST-W1"]     // 可选：按仪器编码筛选；留空=自动评估全部受影响仪器
+}
+```
+
+- 不传 `instrument_codes` 时，自动覆盖：被停用证书所属仪器 +
+  停用前任一候选路径触及被移除证书/边的仪器。
+- 传入 `instrument_codes` 时仅评估指定仪器；其中未受影响的仪器会以
+  `impact: "unchanged"` 返回。不存在的证书 id 返回 **422**，不存在的仪器返回 **404**。
+
+```bash
+curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
+  -H 'Content-Type: application/json' -d '{
+  "at": "2026-06-15T00:00:00Z",
+  "deactivated_certificate_ids": ["CR1-1"]
+}'
+```
+
+响应关键字段：
+
+```jsonc
+{
+  "at": "2026-06-15T00:00:00Z",
+  "deactivated_certificate_ids": ["CR1-1"],
+  "deactivated_certificates": [
+    {"certificate_id": "CR1-1", "cert_number": "CAL-LEN-2025-016",
+     "instrument_code": "INST-R1"}
+  ],
+  "removed_edges": [ /* 随证书一并模拟移除的全部溯源边 */ ],
+  "filtered_by_instruments": false,
+  "affected_instrument_count": 3,
+  "summary": {
+    "unchanged": 0, "degraded": 2, "improved": 0, "affected": 1,
+    "resolution_before": {"unique": 2, "broken": 1},
+    "resolution_after":  {"broken": 3}
+  },
+  "results": [
+    {
+      "instrument_code": "INST-W1",
+      "instrument_name": "数显卡尺",
+      "impact": "degraded",          // unique -> broken
+      "before": {
+        "resolution": "unique", "valid": true,
+        "active_chain": {"certificate_ids": ["CW1-1", "CR1-1", "CG-1"], ...}
+      },
+      "after": {
+        "resolution": "broken", "valid": false, "active_chain": null,
+        "alternative_chains": [
+          {"certificate_ids": ["CW1-1"], "role": "broken_branch",
+           "blocked_by": ["DEAD_END"], ...}
+        ]
+      },
+      "new_conflicts": [
+        {"code": "DEAD_END", "severity": "ERROR", "node": "CW1-1",
+         "path_index": 0, "deactivation_note": "停用后原继续向上溯源的边被一并移除，节点成为死路", ...}
+      ],
+      "removed_certificates_on_paths": ["CR1-1"],
+      "removed_edges_on_paths": [ {"edge_id": 1, "child_cert_id": "CW1-1", "parent_cert_id": "CR1-1"} ]
+    }
+  ],
+  "simulation_only": true
+}
+```
+
+`impact` 分级规则：
+
+| impact | 含义 |
+| --- | --- |
+| `degraded` | `unique → ambiguous/broken`，或 `ambiguous → broken` |
+| `improved` | `ambiguous/broken → unique`（如停用重复送检的一条分支后链唯一） |
+| `affected` | 前后同属多候选或断裂，但具体候选链/冲突集合发生变化 |
+| `unchanged` | 解析结果与有效链均未变化 |
+
+Docker 下示例（假设已 `docker compose up -d` 且自动播种演示数据，
+端口映射到宿主机 8000；也可在 Swagger http://localhost:8000/docs 中直接调用）：
+
+```bash
+# 停用一等量块证书 CR1-1：数显卡尺唯一链断裂、三坐标断链变化
+curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
+  -H 'Content-Type: application/json' \
+  -d '{"at":"2026-06-15T00:00:00Z","deactivated_certificate_ids":["CR1-1"]}'
+
+# 停用活塞压力计 A 证书 CPRA-1：压力表由多候选变为唯一链（仅评估 INST-P1）
+curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
+  -H 'Content-Type: application/json' \
+  -d '{"at":"2026-06-15T00:00:00Z",
+       "deactivated_certificate_ids":["CPRA-1"],
+       "instrument_codes":["INST-P1"]}'
+```
+
 ---
 
 ## 五、内置演示场景
@@ -214,6 +325,9 @@ curl "http://localhost:8000/api/reports/INST-B1?at=2026-06-15T00:00:00Z"
    不确定度单调不收缩、单位一致、边覆盖校准时刻）检查；对链上全部仪器检查历史区间连续性；
 5. 决策：成链且零 ERROR 的路径恰有 1 条 → `unique`；≥2 条 → `ambiguous`；
    0 条 → `broken`。所有 ERROR/WARN 汇总为可解释冲突列表。
+6. 证书停用影响评估：把全部数据装载为内存快照 `Catalog`，在其投影视图
+   （移除待停用证书及子/父端命中的边）上对每台受影响仪器复用步骤 1–5，
+   与停用前报告逐项对比 resolution、链摘要与冲突身份键；全过程不触碰数据库。
 
 ## 七、项目结构
 
@@ -223,10 +337,12 @@ app/
   database.py        SQLite 连接、表结构
   schemas.py         Pydantic 请求/响应模型
   crud.py            upsert 与写入期校验
-  engine.py          溯源链重建（DFS）与全部校验规则
+  engine.py          溯源链重建（DFS）、全部校验规则、证书停用影响评估（内存模拟）
   seed.py            四场景演示数据
   routers/           instruments / certificates / edges /
-                     submissions / trace(report) / export / admin
-tests/test_trace.py  10 个接口级测试
+                     submissions / trace(report) / assessment(停用评估) /
+                     export / admin
+tests/test_trace.py       10 个接口级测试
+tests/test_assessment.py  7 个证书停用影响评估测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```

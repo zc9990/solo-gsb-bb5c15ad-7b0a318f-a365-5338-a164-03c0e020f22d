@@ -156,6 +156,7 @@ class Chain(BaseModel):
     cycle: bool
     errors: int = 0
     warnings: int = 0
+    path_index: Optional[int] = None
 
 
 class TraceReport(BaseModel):
@@ -177,3 +178,126 @@ class TraceReport(BaseModel):
     error_count: int = 0
     warning_count: int = 0
     statistics: dict = Field(default_factory=dict)
+
+
+# ---------- 证书停用影响评估 ----------
+
+class DeactivationAssessmentIn(BaseModel):
+    """证书停用影响评估请求：纯模拟，不会写入数据库。"""
+
+    at: datetime = Field(..., description="评估时点（UTC）")
+    deactivated_certificate_ids: List[str] = Field(
+        ..., min_length=1, description="待停用的证书 id 列表（至少 1 个）"
+    )
+    instrument_codes: Optional[List[str]] = Field(
+        None, description="按仪器编码筛选评估范围；留空则自动评估全部受影响仪器"
+    )
+
+    @field_validator("deactivated_certificate_ids")
+    @classmethod
+    def _check_cert_ids(cls, v: List[str]) -> List[str]:
+        if any(not s or not s.strip() for s in v):
+            raise ValueError("证书 id 不能为空字符串")
+        return v
+
+    @field_validator("instrument_codes")
+    @classmethod
+    def _check_instrument_codes(cls, v):
+        if v is not None and any(not s or not s.strip() for s in v):
+            raise ValueError("仪器编码不能为空字符串")
+        return v
+
+
+class RemovedEdge(BaseModel):
+    edge_id: int
+    child_cert_id: str
+    parent_cert_id: str
+    valid_from: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
+    note: str = ""
+
+
+class DeactivatedCertificateInfo(BaseModel):
+    certificate_id: str
+    cert_number: str
+    instrument_code: str
+
+
+class ChainSummary(BaseModel):
+    path_index: Optional[int] = None
+    certificate_ids: List[str]
+    certificate_numbers: List[str]
+    instrument_codes: List[str]
+    edges: List[dict] = Field(
+        default_factory=list,
+        description="链上溯源边摘要 {edge_id, child_cert_id, parent_cert_id}",
+    )
+    reaches_national_standard: bool
+    errors: int = 0
+    warnings: int = 0
+    role: Optional[str] = Field(
+        None,
+        description="停用后角色：active=唯一有效链 | candidate=有效候选链 | "
+        "invalid_candidate=到基准但未通过校验 | broken_branch=未到基准的断链",
+    )
+    blocked_by: Optional[List[str]] = Field(
+        None, description="invalid_candidate/broken_branch 时阻断该链的冲突编码"
+    )
+
+
+class AssessmentState(BaseModel):
+    resolution: str
+    valid: bool
+    active_chain: Optional[ChainSummary] = None
+    alternative_chains: List[ChainSummary] = Field(default_factory=list)
+    error_count: int = 0
+    warning_count: int = 0
+
+
+class AssessmentConflict(Conflict):
+    deactivation_note: Optional[str] = Field(
+        None, description="该冲突与本次停用的关系说明（仅停用后新增冲突携带）"
+    )
+
+
+class InstrumentImpact(BaseModel):
+    instrument_code: str
+    instrument_name: str
+    impact: str = Field(
+        ...,
+        description="unchanged=无变化 | degraded=唯一->多候选/断裂 或 多候选->断裂 | "
+        "improved=多候选/断裂->唯一有效 | affected=同类状态但链/冲突发生变化",
+    )
+    before: dict = Field(..., description="停用前 {resolution, valid, active_chain, ...}")
+    after: AssessmentState = Field(..., description="停用后状态与替代链摘要")
+    new_conflicts: List[AssessmentConflict] = Field(
+        default_factory=list, description="停用后新出现的可解释冲突"
+    )
+    removed_certificates_on_paths: List[str] = Field(
+        default_factory=list, description="该仪器溯源路径上被移除的证书 id"
+    )
+    removed_edges_on_paths: List[RemovedEdge] = Field(
+        default_factory=list, description="该仪器溯源路径上被移除的溯源边"
+    )
+
+
+class DeactivationAssessmentOut(BaseModel):
+    at: datetime
+    deactivated_certificate_ids: List[str]
+    deactivated_certificates: List[DeactivatedCertificateInfo]
+    removed_edges: List[RemovedEdge] = Field(
+        default_factory=list,
+        description="随证书一并模拟移除的全部溯源边（子端或父端命中即移除）",
+    )
+    filtered_by_instruments: bool = Field(
+        ..., description="是否为按仪器编码筛选后的评估结果"
+    )
+    affected_instrument_count: int
+    summary: dict = Field(
+        ...,
+        description="按 impact 与 resolution 统计的停用前后仪器数量",
+    )
+    results: List[InstrumentImpact]
+    simulation_only: bool = Field(
+        ..., description="始终为 true：评估仅在内存模拟，不写入数据库"
+    )

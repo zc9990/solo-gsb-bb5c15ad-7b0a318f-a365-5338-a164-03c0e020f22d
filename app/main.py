@@ -8,7 +8,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import get_conn_ctx, init_db
-from .routers import certificates, edges, export, instruments, submissions, trace
+from .routers import (
+    assessment,
+    certificates,
+    edges,
+    export,
+    instruments,
+    submissions,
+    trace,
+)
 from .seed import DEMO_AT, seed_demo
 
 
@@ -46,6 +54,7 @@ app.include_router(certificates.router)
 app.include_router(edges.router)
 app.include_router(submissions.router)
 app.include_router(trace.router)
+app.include_router(assessment.router)
 app.include_router(export.router)
 app.include_router(export.admin_router)
 
@@ -61,6 +70,9 @@ def root():
             "validation_report": "/api/reports/{instrument}",
             "json_export": "/api/export/{instrument}",
             "batch_submission": "POST /api/submissions",
+            "deactivation_assessment": (
+                "POST /api/assessments/certificate-deactivation"
+            ),
         },
         "demo_query_time": DEMO_AT,
     }
